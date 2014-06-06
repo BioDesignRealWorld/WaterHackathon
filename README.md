@@ -16,7 +16,7 @@ Device
 
 A floating device for heavy metal sensing in water.
 
-<img src="https://raw.githubusercontent.com/BioDesignRealWorld/WaterHackathon/master/images/float.jpg" width=1024 height=768>
+<img src="https://raw.githubusercontent.com/BioDesignRealWorld/WaterHackathon/master/images/float.jpg" width=800 height=600>
 
 The device can use waypoint navigation using GPS and is equipped with a
 Adafruit DC motor shield to control two propellers.
