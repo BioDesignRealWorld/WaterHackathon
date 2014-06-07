@@ -21,55 +21,56 @@
 
 // Create the motor shield object with the default I2C address
 Adafruit_MotorShield AFMS = Adafruit_MotorShield(); 
-// Or, create it with a different I2C address (say for stacking)
-// Adafruit_MotorShield AFMS = Adafruit_MotorShield(0x61); 
 
 // Select which 'port' M1, M2, M3 or M4. In this case, M1
-Adafruit_DCMotor *left_propeller = AFMS.getMotor(1);
+Adafruit_DCMotor *left_propeller = AFMS.getMotor(2);
 // You can also make another motor on port M2
-Adafruit_DCMotor *right_propeller = AFMS.getMotor(2);
+Adafruit_DCMotor *right_propeller = AFMS.getMotor(1);
 
+// GPS module connection
 // Connect the GPS Power pin to 5V
 // Connect the GPS Ground pin to ground
 // If using software serial (sketch example default):
-//   Connect the GPS TX (transmit) pin to Digital 3
-//   Connect the GPS RX (receive) pin to Digital 2
-// If using hardware serial (e.g. Arduino Mega):
-//   Connect the GPS TX (transmit) pin to Arduino RX1, RX2 or RX3
-//   Connect the GPS RX (receive) pin to matching TX1, TX2 or TX3
+//   Connect the GPS TX (transmit) pin to Digital 2
+//   Connect the GPS RX (receive) pin to Digital 3
 
 // If using software serial, keep these lines enabled
 // (you can change the pin numbers to match your wiring):
 #if ARDUINO >= 100
-SoftwareSerial mySerial(3, 2);
+SoftwareSerial mySerial(2, 3);
 #else
-NewSoftSerial mySerial(3, 2);
+NewSoftSerial mySerial(2, 3);
 #endif
 Adafruit_GPS GPS(&mySerial);
-// If using hardware serial (e.g. Arduino Mega), comment
-// out the above six lines and enable this line instead:
-//Adafruit_GPS GPS(&Serial1);
 
-// Set GPSECHO to 'false' to turn off echoing the GPS data to the Serial console
-// Set to 'true' if you want to debug and listen to the raw GPS sentences. 
-#define GPSECHO  true
+// implement a state machine
+#define WAITING_GPS 0
+#define STRAIGHT 1
+#define TURN 2
+#define STOPPED 3
+int state = WAITING_GPS;
 
-int started = 0;
+// the last position we recorded
 float last_lon, last_lat;
+float cur_lat, cur_lon;
 
+// The waypoint array
+// implement this with SD card later
 int next_waypoint = 0;
 #define N_WAYPOINTS 5
+// 5 points around plage du pelican
 float waypoints_lat[N_WAYPOINTS] = { 46.513279, 46.513058, 46.513103, 46.513377, 46.513414 };
 float waypoints_lon[N_WAYPOINTS] = { 6.572326, 6.572336, 6.573065, 6.573107, 6.572770 };
+// how close we need to be to a waypoint before we consider arrived
 #define WAYPOINT_RADIUS 3.3
 
 // Sampling interval for the GPS
-#define GPS_SAMPLING 60000
 unsigned long last_time;
-
-#define TIME_TURN 1000
-#define MOTOR_SPEED_LEFT 10
-#define MOTOR_SPEED_RIGHT 10
+#define TIME_WAITING 5000
+#define TIME_STRAIGHT 10000
+#define TIME_TURN 2000
+#define MOTOR_SPEED_LEFT 100
+#define MOTOR_SPEED_RIGHT 100
 
 void setup()
 {
@@ -80,116 +81,165 @@ void setup()
   GPS.sendCommand(PMTK_SET_NMEA_OUTPUT_RMCGGA);
   GPS.sendCommand(PMTK_SET_NMEA_UPDATE_1HZ);
 
-  // the nice thing about this code is you can have a timer0 interrupt go off
-  // every 1 millisecond, and read data from the GPS for you. that makes the
-  // loop code a heck of a lot easier!
-  useInterrupt(true);
-
   // Start the motor
   AFMS.begin();  // create with the default frequency 1.6KHz
 
+  // stop the motors
+  motor_stop();
+
   // start counter
   last_time = millis();
+
+  Serial.println("Hello Float.");
 }
 
 void loop()
 {
+  // Receive from GPS
+  char c = GPS.read();
 
   // if a sentence is received, we can check the checksum, parse it...
   if (GPS.newNMEAreceived()) {
     // a tricky thing here is if we print the NMEA sentence, or data
     // we end up not listening and catching other sentences! 
     // so be very wary if using OUTPUT_ALLDATA and trytng to print out data
-    //Serial.println(GPS.lastNMEA());   // this also sets the newNMEAreceived() flag to false
 
     if (!GPS.parse(GPS.lastNMEA()))   // this also sets the newNMEAreceived() flag to false
       return;  // we can fail to parse a sentence in which case we should just wait for another
+
+    // Convert silly GPS lat/lon format to degrees
+    int lat_i = (int)(GPS.latitude/100);
+    float lat_f = (GPS.latitude-(lat_i*100.))/60.;
+    cur_lat = (lat_i + lat_f);
+
+    int lon_i = (int)(GPS.longitude/100);
+    float lon_f = (GPS.longitude-(lon_i*100.))/60.;
+    cur_lon = (lon_i + lon_f);
   }
 
-  // when counter expires, do the interesting stuff
-  if (ellapsed_millis(last_time) > GPS_SAMPLING)
+  switch (state)
   {
-    // STOP moving straight
-    motor_stop();
-
-    // Process geographical coordinate
-    if (!started)
-    {
-      // if we just started, just recorde the starting point
-      last_lon = GPS.longitude/180.*M_PI;
-      last_lat = GPS.latitude/180.*M_PI;
-    }
-    else
-    {
-      // transform angles to radian
-      float lat_now = GPS.latitude/180.*M_PI;
-      float lon_now = GPS.longitude/180.*M_PI;
-      float lat_way = waypoints_lat[next_waypoint]/180.*M_PI;
-      float lon_way = waypoints_lon[next_waypoint]/180.*M_PI;
-
-      // compute distance to next waypoint using haversine formula
-      float s_lat = sin((lat_now-lat_way)/2);
-      float s_lon = sin((lon_now-lon_way)/2);
-      float a = s_lat*s_lat + cos(GPS.latitude)*cos(waypoints_lat[next_waypoint])*s_lon*s_lon;
-      float c = 2*atan2(sqrt(a), sqrt(1-a));
-      float distance = RADIUS_EARTH*c;
-
-      if (distance < WAYPOINT_RADIUS)
+    // GPS finally started
+    case WAITING_GPS:
+      if (GPS.fix)
       {
-        // MAYBE DO SOMETHING HERE
+        Serial.println("Acquired GPS fix.");
+        // if we just started, just recorde the starting point
+        last_lat = cur_lat;
+        last_lon = cur_lon;
 
-        // go to next waypoint
-        next_waypoint++;
+        // go into straight driving mode
+        state = STRAIGHT;
+        motor_go_straight();
+        last_time = millis();
       }
-      else if (next_waypoint < N_WAYPOINTS)
+      else if (ellapsed_millis(last_time) > TIME_WAITING)
       {
-        // Now see where you should be going next
-        float nx = -(lon_way-last_lon);
-        float ny = lat_way-last_lat;
-        float dx = lat_now - last_lat;
-        float dy = lon_now - last_lon;
-        int go_left = nx*dx + ny*dy > 0;
+        Serial.println("No GPS yet.");
+        last_time = millis();
+      }
+      break;
 
-        motor_turn(go_left);
-        delay(TIME_TURN);
+    case STRAIGHT:
+      if (ellapsed_millis(last_time) > TIME_STRAIGHT)
+      {
+        // STOP moving straight
         motor_stop();
+
+        if (GPS.fix)
+        {
+          Serial.print("Current lat,lon: ");
+          Serial.print(cur_lat, 6);
+          Serial.print(",");
+          Serial.println(cur_lon, 6);
+          Serial.print("Next lat,lon: ");
+          Serial.print(waypoints_lat[next_waypoint], 6);
+          Serial.print(",");
+          Serial.println(waypoints_lon[next_waypoint], 6);
+
+          // transform angles to radian
+          float lat_now = cur_lat/180.*M_PI;
+          float lon_now = cur_lon/180.*M_PI;
+          float lat_way = waypoints_lat[next_waypoint]/180.*M_PI;
+          float lon_way = waypoints_lon[next_waypoint]/180.*M_PI;
+
+          // compute distance to next waypoint using haversine formula
+          float s_lat = sin((lat_now-lat_way)/2);
+          float s_lon = sin((lon_now-lon_way)/2);
+          float a = s_lat*s_lat + cos(lat_now)*cos(lat_way)*s_lon*s_lon;
+          float c = 2*atan2(sqrt(a), sqrt(1-a));
+          float distance = RADIUS_EARTH*c;
+
+          Serial.print("Distance to next point :");
+          Serial.println(distance);
+
+          if (distance < WAYPOINT_RADIUS)
+          {
+            // MAYBE DO SOMETHING HERE
+
+            // go to next waypoint
+            next_waypoint++;
+
+            // update waypoint
+            if (next_waypoint < N_WAYPOINTS)
+            {
+              lat_way = waypoints_lat[next_waypoint]/180.*M_PI;
+              lon_way = waypoints_lon[next_waypoint]/180.*M_PI;
+            }
+            else
+            {
+              // we got to the last waypoint, do nothing
+              Serial.println("Arrived to destination.");
+              state = STOPPED;
+            }
+          }
+
+          if (next_waypoint < N_WAYPOINTS)
+          {
+            // Now see where you should be going next
+            float nx = -(lon_way-last_lon);
+            float ny = lat_way-last_lat;
+            float dx = lat_now - last_lat;
+            float dy = lon_now - last_lon;
+            int go_left = nx*dx + ny*dy > 0;
+
+            if (go_left)
+              Serial.println("Going left");
+            else
+              Serial.println("Going right");
+
+            // go into turning mode
+            state = TURN;
+            motor_turn(go_left);
+            last_time = millis();
+          }
+
+          // save current location
+          last_lat = lat_now;
+          last_lon = lon_now;
+        }
+        else
+        {
+          Serial.println("Lost GPS fix.");
+          state = WAITING_GPS;
+          last_time = millis();
+        }
       }
+      break;
 
-      // Now start moving straight
-      motor_go_straight(MOTOR_SPEED_LEFT, MOTOR_SPEED_RIGHT);
+    case TURN:
+      if (ellapsed_millis(last_time) > TIME_TURN)
+      {
+        // stop the motor
+        motor_stop();
+        
+        // go into driving straight mode
+        state = STRAIGHT;
+        motor_go_straight();
+        last_time = millis();
 
-      // reset timer
-      last_time = millis();
-
-      // save current location
-      last_lat = lat_now;
-      last_lon = lon_now;
-
-    }
-  }
-}
-
-// Interrupt is called once a millisecond, looks for any new GPS data, and stores it
-SIGNAL(TIMER0_COMPA_vect) {
-  char c = GPS.read();
-  // if you want to debug, this is a good time to do it!
-  if (GPSECHO)
-    if (c) UDR0 = c;  
-  // writing direct to UDR0 is much much faster than Serial.print 
-  // but only one character can be written at a time. 
-}
-
-void useInterrupt(boolean v) {
-  if (v) {
-    // Timer0 is already used for millis() - we'll just interrupt somewhere
-    // in the middle and call the "Compare A" function above
-    OCR0A = 0xAF;
-    TIMSK0 |= _BV(OCIE0A);
-    //usingInterrupt = true;
-  } else {
-    // do not call the interrupt function COMPA anymore
-    TIMSK0 &= ~_BV(OCIE0A);
-    //usingInterrupt = false;
+      }
+      break;
   }
 }
 
@@ -204,13 +254,13 @@ unsigned long ellapsed_millis(unsigned long start)
     return (ULONG_MAX + now - start);
 }
 
-void motor_go_straight(int speed_motor_left, int speed_motor_right)
+void motor_go_straight()
 {
   // Set the speed to start, from 0 (off) to 255 (max speed)
-  left_propeller->setSpeed(speed_motor_left);
+  left_propeller->setSpeed(MOTOR_SPEED_LEFT);
   left_propeller->run(FORWARD);
 
-  right_propeller->setSpeed(speed_motor_right);
+  right_propeller->setSpeed(MOTOR_SPEED_RIGHT);
   right_propeller->run(FORWARD);
 }
 
@@ -225,10 +275,12 @@ void motor_turn(int go_left)
   if (go_left)
   {
     right_propeller->run(FORWARD);
+    left_propeller->run(BACKWARD);
   }
   else
   {
     left_propeller->run(FORWARD);
+    right_propeller->run(BACKWARD);
   }
 }
 
